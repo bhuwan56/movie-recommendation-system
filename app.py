@@ -4,7 +4,7 @@ import streamlit as st
 # =============================
 # CONFIG
 # =============================
-API_BASE = "https://movie-rec-466x.onrender.com"  # fallback removed, just use main API
+API_BASE = "https://movie-recommendation-system-2-39c8.onrender.com/" or "https://movie-rec-466x.onrender.com"  # fallback removed, just use main API
 TMDB_IMG = "https://image.tmdb.org/t/p/w500"
 
 st.set_page_config(page_title="Movie Recommender", page_icon="🎬", layout="wide")
