@@ -91,6 +91,28 @@ class SearchBundleResponse(BaseModel):
     genre_recommendations: List[TMDBMovieCard]
 
 
+class WatchHistoryRequest(BaseModel):
+    watch_history: List[str]
+    top_n: int = 12
+    min_vote_average: float = 7.0
+    min_watch_count: int = 1
+
+
+class WatchHistoryRecommendationItem(BaseModel):
+    title: str
+    score: float
+    vote_average: Optional[float] = None
+    popularity: Optional[float] = None
+    tmdb: Optional[TMDBMovieCard] = None
+
+
+class WatchHistoryRecommendationResponse(BaseModel):
+    watch_history: List[str]
+    matched_titles: List[str]
+    skipped_titles: List[str]
+    recommendations: List[WatchHistoryRecommendationItem]
+
+
 # =========================
 # UTILS
 # =========================
@@ -257,6 +279,105 @@ def tfidf_recommend_titles(
     return out
 
 
+def resolve_local_titles(titles: List[str]) -> Tuple[List[str], List[str], List[int]]:
+    matched_titles: List[str] = []
+    skipped_titles: List[str] = []
+    matched_indices: List[int] = []
+
+    for raw_title in titles:
+        title = str(raw_title or "").strip()
+        if not title:
+            continue
+
+        try:
+            idx = get_local_idx_by_title(title)
+        except HTTPException:
+            skipped_titles.append(title)
+            continue
+
+        matched_indices.append(int(idx))
+        matched_titles.append(str(df.iloc[int(idx)]["title"]))
+
+    return matched_titles, skipped_titles, matched_indices
+
+
+def recommend_from_watch_history(
+    watch_history: List[str],
+    top_n: int = 12,
+    min_vote_average: float = 7.0,
+    min_watch_count: int = 1,
+) -> Dict[str, Any]:
+    """
+    Recommend highly rated movies similar to the user's watch history.
+
+    Pipeline:
+    - map watch-history titles into the local TF-IDF index
+    - average their TF-IDF similarity scores
+    - filter to highly rated movies
+    - exclude already watched titles
+    """
+    global df, tfidf_matrix
+    if df is None or tfidf_matrix is None:
+        raise HTTPException(status_code=500, detail="TF-IDF resources not loaded")
+
+    matched_titles, skipped_titles, matched_indices = resolve_local_titles(watch_history)
+    if len(matched_indices) < max(1, int(min_watch_count)):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Not enough watch-history titles matched the local dataset. "
+                f"Matched={len(matched_indices)}, required={max(1, int(min_watch_count))}."
+            ),
+        )
+
+    similarity_scores = np.asarray(tfidf_matrix[:, matched_indices].sum(axis=1)).ravel()
+    similarity_scores = similarity_scores / float(len(matched_indices))
+
+    watched_idx = set(int(i) for i in matched_indices)
+    filtered = df.copy()
+    filtered = filtered.assign(_score=similarity_scores)
+    filtered = filtered.loc[~filtered.index.isin(watched_idx)]
+
+    if "vote_average" in filtered.columns:
+        filtered = filtered.loc[
+            pd.to_numeric(filtered["vote_average"], errors="coerce") >= float(min_vote_average)
+        ]
+
+    sort_columns = ["_score"]
+    ascending = [False]
+
+    if "vote_average" in filtered.columns:
+        sort_columns.append("vote_average")
+        ascending.append(False)
+
+    if "popularity" in filtered.columns:
+        sort_columns.append("popularity")
+        ascending.append(False)
+
+    filtered = filtered.sort_values(sort_columns, ascending=ascending)
+
+    recommendations: List[Dict[str, Any]] = []
+    for _, row in filtered.head(top_n).iterrows():
+        recommendations.append(
+            {
+                "title": str(row["title"]),
+                "score": float(row["_score"]),
+                "vote_average": (
+                    float(row["vote_average"]) if pd.notna(row.get("vote_average")) else None
+                ),
+                "popularity": (
+                    float(row["popularity"]) if pd.notna(row.get("popularity")) else None
+                ),
+            }
+        )
+
+    return {
+        "matched_titles": matched_titles,
+        "skipped_titles": skipped_titles,
+        "recommendations": recommendations,
+    }
+
+
 async def attach_tmdb_card_by_title(title: str) -> Optional[TMDBMovieCard]:
     """
     Uses TMDB search by title to fetch poster for a local title.
@@ -404,6 +525,36 @@ async def recommend_tfidf(
 ):
     recs = tfidf_recommend_titles(title, top_n=top_n)
     return [{"title": t, "score": s} for t, s in recs]
+
+
+@app.post("/recommend/watch-history", response_model=WatchHistoryRecommendationResponse)
+async def recommend_watch_history(payload: WatchHistoryRequest):
+    result = recommend_from_watch_history(
+        watch_history=payload.watch_history,
+        top_n=payload.top_n,
+        min_vote_average=payload.min_vote_average,
+        min_watch_count=payload.min_watch_count,
+    )
+
+    items: List[WatchHistoryRecommendationItem] = []
+    for rec in result["recommendations"]:
+        card = await attach_tmdb_card_by_title(rec["title"])
+        items.append(
+            WatchHistoryRecommendationItem(
+                title=rec["title"],
+                score=rec["score"],
+                vote_average=rec["vote_average"],
+                popularity=rec["popularity"],
+                tmdb=card,
+            )
+        )
+
+    return WatchHistoryRecommendationResponse(
+        watch_history=[str(x).strip() for x in payload.watch_history if str(x).strip()],
+        matched_titles=result["matched_titles"],
+        skipped_titles=result["skipped_titles"],
+        recommendations=items,
+    )
 
 
 # ---------- BUNDLE: Details + TF-IDF recs + Genre recs ----------
